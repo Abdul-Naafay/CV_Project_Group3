@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Room Virtual Tour (SfM)</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #111;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      color: #eee;
+    }
+    #overlay {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      padding: 6px 10px;
+      background: rgba(0, 0, 0, 0.45);
+      border-radius: 6px;
+      font-size: 13px;
+      max-width: 260px;
+    }
+    #photoPanel {
+      position: absolute;
+      right: 20px;
+      bottom: 20px;
+      width: 360px;
+      max-height: 260px;
+      background: rgba(0, 0, 0, 0.85);
+      border-radius: 8px;
+      padding: 8px;
+      box-shadow: 0 0 15px rgba(0,0,0,0.7);
+      display: none;
+      z-index: 20;
+    }
+    #photoPanel img {
+      width: 100%;
+      max-height: 230px;
+      object-fit: contain;
+      border-radius: 4px;
+    }
+    #photoClose {
+      position: absolute;
+      top: 4px;
+      right: 8px;
+      border: none;
+      background: none;
+      color: #fff;
+      font-size: 18px;
+      cursor: pointer;
+    }
+    #photoCaption {
+      font-size: 11px;
+      color: #ccc;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+<div id="overlay">
+  <b>Controls</b><br/>
+  • Drag = rotate &nbsp; • Scroll = zoom &nbsp; • Right drag = pan<br/>
+  • WASD = move in plane &nbsp; • Q/E = move up/down<br/>
+  • Click anywhere on the room = jump to best camera + show that image.
+</div>
+
+<div id="photoPanel">
+  <button id="photoClose">&times;</button>
+  <img id="photoImg" src="" alt="View from this camera">
+  <div id="photoCaption"></div>
+</div>
+
+<!-- Import map so "three" and example modules resolve correctly -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+    "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/controls/OrbitControls.js",
+    "three/examples/jsm/loaders/MTLLoader.js": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/loaders/MTLLoader.js",
+    "three/examples/jsm/loaders/OBJLoader.js": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/loaders/OBJLoader.js"
+  }
+}
+</script>
+
+<script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+  import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
+  import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+
+  // ------------ INTRINSICS (match your Python K) ------------
+  // Adjust if your working image resolution is different
+  const imgWidth  = 1200;
+  const imgHeight = 1600;
+  const fx = 633.3333333333334;
+  const fy = 633.3333333333334;
+  const cx = imgWidth / 2;
+  const cy = imgHeight / 2;
+
+  // ------------ BASIC SCENE ------------
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x111111);
+
+  const camera = new THREE.PerspectiveCamera(
+    60,
+    window.innerWidth / window.innerHeight,
+    0.1,
+    2000
+  );
+  camera.position.set(0, 2, 8);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.target.set(0, 1.5, 0);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(6, 10, 4);
+  scene.add(dirLight);
+
+  const grid = new THREE.GridHelper(20, 20, 0x444444, 0x222222);
+  scene.add(grid);
+
+  // ------------ MODEL LOADING ------------
+  let roomMesh = null;
+  let modelScale = 1.0;
+  let modelCenterScaled = new THREE.Vector3();
+
+  const mtlLoader = new MTLLoader();
+  mtlLoader.setPath('./');
+
+  mtlLoader.load('cv_model2.mtl', (materials) => {
+    materials.preload();
+
+    const objLoader = new OBJLoader();
+    objLoader.setMaterials(materials);
+    objLoader.setPath('./');
+
+    objLoader.load(
+      'cv_model2.obj',
+      (object) => {
+        const box = new THREE.Box3().setFromObject(object);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z) || 1.0;
+
+        modelScale = 5 / maxDim;
+        object.scale.setScalar(modelScale);
+
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        center.multiplyScalar(modelScale);
+        modelCenterScaled.copy(center);
+        object.position.sub(center);
+
+        roomMesh = object;
+        scene.add(object);
+        console.log('Model loaded');
+      },
+      undefined,
+      (err) => console.error('OBJ loading error:', err)
+    );
+  }, undefined, (err) => console.error('MTL loading error:', err));
+
+  // ------------ LOAD CAMERA POSES (with R, t) ------------
+  let cameras = [];  // {id, image, position:[x,y,z], R, t}
+
+  fetch('cameras.json')
+    .then(r => r.json())
+    .then(data => {
+      cameras = data.cameras || [];
+      console.log(`Loaded ${cameras.length} cameras with poses`);
+    })
+    .catch(err => console.error('Error loading cameras.json:', err));
+
+  // ------------ RAYCAST + CLICK HANDLING ------------
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+
+  const photoPanel   = document.getElementById('photoPanel');
+  const photoImg     = document.getElementById('photoImg');
+  const photoCaption = document.getElementById('photoCaption');
+  const photoClose   = document.getElementById('photoClose');
+
+  photoClose.addEventListener('click', () => {
+    photoPanel.style.display = 'none';
+  });
+
+  // small sphere to mark clicked point
+  const highlightMat  = new THREE.MeshBasicMaterial({ color: 0x00ffcc });
+  const highlightGeom = new THREE.SphereGeometry(0.05, 16, 16);
+  const highlight     = new THREE.Mesh(highlightGeom, highlightMat);
+  highlight.visible   = false;
+  scene.add(highlight);
+
+  // camera animation state
+  let animatingCam      = false;
+  let camStartPos       = new THREE.Vector3();
+  let camStartTarget    = new THREE.Vector3();
+  let camEndPos         = new THREE.Vector3();
+  let camEndTarget      = new THREE.Vector3();
+  let camAnimStartTime  = 0;
+  const camAnimDuration = 1.5; // seconds
+
+  function onClick(event) {
+    if (!roomMesh || cameras.length === 0) return;
+
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const hits = raycaster.intersectObject(roomMesh, true);
+    if (hits.length === 0) return;
+
+    // clicked point in VIEWER coords
+    const hitPointVis = hits[0].point.clone();
+    highlight.position.copy(hitPointVis);
+    highlight.visible = true;
+
+    // Convert to original SfM world coords:
+    // P_vis = scale * P_world - center_scaled  =>  P_world = (P_vis + center_scaled) / scale
+    const worldPoint = hitPointVis.clone()
+      .add(modelCenterScaled)
+      .divideScalar(modelScale);
+
+    // ---- PICK CAMERA THAT ACTUALLY SEES THE POINT ----
+    let bestCam       = null;
+    let bestScore     = Infinity;
+    let bestProj      = null; // store {u, v, z}
+    let bestXcam      = null; // store X_cam
+
+    for (const cam of cameras) {
+      // Build rotation + translation
+      const Rflat = cam.R.flat
+        ? cam.R.flat()
+        : cam.R.reduce((acc, row) => acc.concat(row), []);
+      const Rm = new THREE.Matrix3().fromArray(Rflat);
+      const t  = new THREE.Vector3().fromArray(cam.t);
+
+      const X = worldPoint.clone();
+      const X_cam = new THREE.Vector3(
+        Rm.elements[0]*X.x + Rm.elements[1]*X.y + Rm.elements[2]*X.z + t.x,
+        Rm.elements[3]*X.x + Rm.elements[4]*X.y + Rm.elements[5]*X.z + t.y,
+        Rm.elements[6]*X.x + Rm.elements[7]*X.y + Rm.elements[8]*X.z + t.z
+      );
+
+      // Behind camera -> skip
+      if (X_cam.z <= 1e-3) continue;
+
+      // Project into image
+      const u = fx * (X_cam.x / X_cam.z) + cx;
+      const v = fy * (X_cam.y / X_cam.z) + cy;
+
+      // Outside image bounds -> skip
+      if (u < 0 || u >= imgWidth || v < 0 || v >= imgHeight) continue;
+
+      // Score = how central this point is in the image
+      const score = Math.abs(u - cx) + Math.abs(v - cy);
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestCam   = cam;
+        bestProj  = { u, v, z: X_cam.z };
+        bestXcam  = X_cam;
+      }
+    }
+
+    // Fallback: if no camera "sees" the point, fall back to nearest center
+    if (!bestCam) {
+      let nearest = null;
+      let bestDist = Infinity;
+      for (const cam of cameras) {
+        const C = new THREE.Vector3().fromArray(cam.position);
+        const d = C.distanceTo(worldPoint);
+        if (d < bestDist) { bestDist = d; nearest = cam; }
+      }
+      bestCam = nearest;
+      bestProj = null;
+    }
+
+    if (!bestCam) return; // still nothing? bail
+
+    // Camera centre in SfM world
+    const C_world = new THREE.Vector3().fromArray(bestCam.position);
+
+    // Transform that to viewer coords: C_vis = scale*C_world - center_scaled
+    const C_vis = C_world.clone().multiplyScalar(modelScale).sub(modelCenterScaled);
+
+    // Animate viewer camera from current pos/target to new pose
+    camStartPos.copy(camera.position);
+    camStartTarget.copy(controls.target);
+
+    camEndPos.copy(C_vis);
+    camEndTarget.copy(hitPointVis);  // look towards the clicked location
+
+    camAnimStartTime = performance.now();
+    animatingCam     = true;
+
+    // ---- Show corresponding image ----
+    let projInfo = '';
+    if (bestProj) {
+      projInfo = `Projected pixel: (u ≈ ${bestProj.u.toFixed(1)}, v ≈ ${bestProj.v.toFixed(1)})`;
+    } else {
+      projInfo = 'Point is outside this camera\'s field-of-view; using nearest camera.';
+    }
+
+    photoImg.src = bestCam.image;  // e.g. dataset2/xx.jpeg
+    photoCaption.textContent = `Camera ${bestCam.id} · ${bestCam.image} · ${projInfo}`;
+    photoPanel.style.display = 'block';
+  }
+
+  renderer.domElement.addEventListener('click', onClick);
+
+  // ------------ WASD + QE movement ------------
+  const keyState = {};
+
+  window.addEventListener('keydown', (e) => {
+    keyState[e.key.toLowerCase()] = true;
+  });
+  window.addEventListener('keyup', (e) => {
+    keyState[e.key.toLowerCase()] = false;
+  });
+
+  function updateKeyboardMovement(deltaTime) {
+    const speed = 3.0; // units per second
+
+    const forward = new THREE.Vector3();
+    camera.getWorldDirection(forward);
+    forward.y = 0;
+    forward.normalize();
+
+    const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+    const up    = new THREE.Vector3(0, 1, 0);
+
+    const move = new THREE.Vector3();
+
+    if (keyState['w']) move.add(forward);
+    if (keyState['s']) move.sub(forward);
+    if (keyState['a']) move.sub(right);
+    if (keyState['d']) move.add(right);
+    if (keyState['q']) move.sub(up);
+    if (keyState['e']) move.add(up);
+
+    if (move.lengthSq() > 0) {
+      move.normalize().multiplyScalar(speed * deltaTime);
+      camera.position.add(move);
+      controls.target.add(move);
+    }
+  }
+
+  // ------------ RENDER LOOP ------------
+  let lastTime = performance.now();
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    const now = performance.now();
+    const dt  = (now - lastTime) / 1000.0;
+    lastTime  = now;
+
+    updateKeyboardMovement(dt);
+
+    if (animatingCam) {
+      const t = (now - camAnimStartTime) / 1000.0 / camAnimDuration;
+      if (t >= 1.0) {
+        camera.position.copy(camEndPos);
+        controls.target.copy(camEndTarget);
+        animatingCam = false;
+      } else {
+        const s = t * t * (3 - 2 * t); // smoothstep
+        camera.position.lerpVectors(camStartPos,  camEndPos,  s);
+        controls.target.lerpVectors (camStartTarget, camEndTarget, s);
+      }
+    }
+
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // ------------ RESIZE ------------
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+</script>
+</body>
+</html>
